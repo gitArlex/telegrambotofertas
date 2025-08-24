@@ -253,7 +253,8 @@ async def webhook(req: Request):
 # ---------- Set Webhook ----------
 async def set_webhook():
     WEBHOOK_URL = os.environ.get("WEBHOOK_URL")  # exemplo: https://meuapp.onrender.com/webhook
-    if not WEBHOOK_URL: raise RuntimeError("Defina WEBHOOK_URL")
+    if not WEBHOOK_URL:
+        raise RuntimeError("Defina WEBHOOK_URL")
     import asyncio
     asyncio.run(app_telegram.bot.set_webhook(WEBHOOK_URL))
 
