@@ -105,10 +105,15 @@ def get_subscribed_users():
 
 # ---------- Bot setup ----------
 TOKEN = os.environ.get("TELEGRAM_TOKEN")
-if not TOKEN: raise RuntimeError("Defina TELEGRAM_TOKEN")
-bot = Bot(TOKEN)
+if not TOKEN:
+    raise RuntimeError("Defina TELEGRAM_TOKEN")
+
 init_db()
-app_telegram = ApplicationBuilder().bot(bot).build()
+
+# Aplicação Telegram apenas com ApplicationBuilder
+from telegram.ext import Application
+
+app_telegram = Application.builder().token(TOKEN).build()
 
 # ---------- Commands ----------
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -247,10 +252,11 @@ async def webhook(req: Request):
 
 # ---------- Set Webhook ----------
 async def set_webhook():
-    url = os.environ.get("WEBHOOK_URL")  # exemplo: https://meuapp.onrender.com/webhook
-    if not url: raise RuntimeError("Defina WEBHOOK_URL")
-    await bot.set_webhook(url)
-    logger.info(f"Webhook setado em {url}")
+    WEBHOOK_URL = os.environ.get("WEBHOOK_URL")  # exemplo: https://meuapp.onrender.com/webhook
+    if not WEBHOOK_URL:
+    raise RuntimeError("Defina WEBHOOK_URL")
+    import asyncio
+    asyncio.run(app_telegram.bot.set_webhook(WEBHOOK_URL))
 
 # ---------- Run ----------
 if __name__ == "__main__":
