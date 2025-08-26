@@ -1,14 +1,10 @@
-#!/usr/bin/env python3
-"""
-Bot Telegram com WEBHOOK usando FastAPI + python-telegram-bot (sem aiohttp).
-Recebe updates no endpoint /webhook e coloca na application.update_queue.
-Persistência em SQLite (bot.db).
-Destinado a rodar como Web Service (Render).
-"""
 import os
 import sqlite3
 import logging
 import unicodedata
+import asyncio
+import time
+import urllib.parse
 from typing import Optional
 
 from fastapi import FastAPI, Request, HTTPException
@@ -27,6 +23,8 @@ PORT = int(os.environ.get("PORT", 8000))
 TELEGRAM_TOKEN = os.environ.get("TELEGRAM_TOKEN")
 WEBHOOK_URL = os.environ.get("WEBHOOK_URL")  # ex: https://<seu-servico>.onrender.com/webhook
 MAX_WEBHOOK_CONNECTIONS = int(os.environ.get("MAX_WEBHOOK_CONNECTIONS", "40"))
+SETWEBHOOK_MAX_RETRIES = int(os.environ.get("SETWEBHOOK_MAX_RETRIES", "6"))
+SETWEBHOOK_INITIAL_BACKOFF = float(os.environ.get("SETWEBHOOK_INITIAL_BACKOFF", "1.0"))  # segundos
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
 logger = logging.getLogger(__name__)
@@ -34,7 +32,7 @@ logger = logging.getLogger(__name__)
 if not TELEGRAM_TOKEN:
     raise RuntimeError("Defina TELEGRAM_TOKEN")
 if not WEBHOOK_URL:
-    raise RuntimeError("Defina WEBHOOK_URL")
+    raise RuntimeError("Defina WEBHOOK_URL (ex: https://meuservico.onrender.com/webhook)")
 
 # ---------- DB ----------
 def init_db():
@@ -254,6 +252,7 @@ async def on_message(update: Update, context):
                 logger.exception("Falha ao encaminhar para %s: %s", uid, e)
 
 # ---------- Application / FastAPI ----------
+# create application instance (do NOT start it right away)
 application = Application.builder().token(TELEGRAM_TOKEN).concurrent_updates(True).build()
 
 # register handlers
@@ -273,32 +272,91 @@ application.add_handler(MessageHandler(filters.ALL & (~filters.COMMAND), on_mess
 
 app = FastAPI()
 
+# Background initialization task
+async def initialize_telegram_app_with_retries():
+    """
+    Initialize and start Application and set webhook.
+    Retries set_webhook with exponential backoff to avoid crashing startup.
+    """
+    try:
+        logger.info("Inicializando Application (initialize + start)...")
+        await application.initialize()
+        await application.start()
+    except Exception as e:
+        logger.exception("Erro na inicialização do Application: %s", e)
+        # If init/start failed, leave process running and attempt retries for start
+        # Try to re-run initialize/start a few times
+        for attempt in range(1, 6):
+            wait = min(60, 2 ** attempt)
+            logger.info("Tentando reinicializar Application (tentativa %d) em %ds...", attempt, wait)
+            await asyncio.sleep(wait)
+            try:
+                await application.initialize()
+                await application.start()
+                logger.info("Application inicializado com sucesso na tentativa %d", attempt)
+                break
+            except Exception as e2:
+                logger.exception("Falha na tentativa %d: %s", attempt, e2)
+        else:
+            logger.error("Não foi possível inicializar o Application após várias tentativas. Continuando sem bot ativo.")
+            return
+
+    # set webhook with retries (since Telegram pode recusar temporariamente)
+    backoff = SETWEBHOOK_INITIAL_BACKOFF
+    for attempt in range(1, SETWEBHOOK_MAX_RETRIES + 1):
+        try:
+            # attempt to set webhook
+            await application.bot.set_webhook(WEBHOOK_URL, max_connections=MAX_WEBHOOK_CONNECTIONS)
+            logger.info("Webhook definido com sucesso: %s", WEBHOOK_URL)
+            return
+        except Exception as e:
+            logger.exception("Falha ao set_webhook (tentativa %d/%d): %s", attempt, SETWEBHOOK_MAX_RETRIES, e)
+            if attempt == SETWEBHOOK_MAX_RETRIES:
+                logger.error("Max retries atingido. O webhook não foi definido. O serviço permanecerá vivo e tentará novamente no próximo start.")
+                return
+            await asyncio.sleep(backoff)
+            backoff = backoff * 2
+
 @app.on_event("startup")
-async def startup():
-    # initialize and start application (this spawns the tasks that consume update_queue)
-    logger.info("Inicializando aplicação Telegram...")
-    await application.initialize()
-    await application.start()
-    # set webhook (awaited)
-    await application.bot.set_webhook(WEBHOOK_URL, max_connections=MAX_WEBHOOK_CONNECTIONS)
-    logger.info("Webhook definido: %s", WEBHOOK_URL)
+async def on_startup():
+    # start DB and schedule background init
+    init_db()
+    # Start initialize task but don't await it (keeps HTTP server responsive)
+    asyncio.create_task(initialize_telegram_app_with_retries())
 
 @app.on_event("shutdown")
-async def shutdown():
-    logger.info("Shutting down Telegram application...")
+async def on_shutdown():
+    logger.info("Shutdown iniciado: tentando limpar webhook e parar Application...")
     try:
-        # delete webhook so Telegram stops sending updates
-        await application.bot.delete_webhook()
+        if application.bot:
+            try:
+                await application.bot.delete_webhook()
+                logger.info("Webhook deletado.")
+            except Exception:
+                logger.exception("Falha ao deletar webhook (ignorado).")
     except Exception:
         pass
-    await application.stop()
-    await application.shutdown()
+    try:
+        # Stop and shutdown application if it was started
+        await application.stop()
+        await application.shutdown()
+    except Exception:
+        logger.exception("Erro ao parar Application (ignorado).")
+
+# Helper to check if application is ready (has update_queue)
+def application_ready() -> bool:
+    return hasattr(application, "update_queue") and application.update_queue is not None
 
 @app.post("/webhook")
 async def webhook_entry(request: Request):
+    # Telegram will post updates here. If application not ready, return 503 so Telegram may retry.
+    if not application_ready():
+        logger.warning("Recebeu update mas application ainda não pronto -> 503")
+        raise HTTPException(status_code=503, detail="Bot not ready")
     try:
         data = await request.json()
     except Exception:
+        logger.exception("JSON inválido recebido em /webhook")
         raise HTTPException(status_code=400, detail="json inválido")
     update = Update.de_json(data, application.bot)
     # Push into Application update queue to be processed by handlers
@@ -307,9 +365,10 @@ async def webhook_entry(request: Request):
 
 @app.get("/")
 async def root():
-    return {"ok": True, "info": "Bot webhook running"}
+    return {"ok": True, "info": "Bot webhook alive"}
 
+# ---------- run ----------
 if __name__ == "__main__":
-    init_db()
-    # uvicorn will run the FastAPI app; Render sets PORT
-    uvicorn.run("bot_webhook:app", host="0.0.0.0", port=PORT, log_level="info")
+    # Run uvicorn; Render providencia PORT
+    logger.info("Starting web server (uvicorn) on port %s", PORT)
+    uvicorn.run(app, host="0.0.0.0", port=PORT, log_level="info")
