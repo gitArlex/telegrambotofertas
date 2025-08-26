@@ -1,3 +1,2 @@
-Flask>=2.0
-python-telegram-bot>=20.0
-gunicorn
+python-telegram-bot==20.5
+aiohttp==3.8.5
