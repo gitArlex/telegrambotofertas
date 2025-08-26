@@ -374,14 +374,12 @@ def webhook():
 
 
 # Ao inicializar, tenta setar webhook
-@app.before_first_request
-def setup_webhook():
+with app.app_context():
     try:
         bot.set_webhook(WEBHOOK_URL)
         print('Webhook setado em', WEBHOOK_URL)
     except Exception as e:
         print('Falha ao setar webhook:', e)
-
 
 if __name__ == '__main__':
     # Para debug local
