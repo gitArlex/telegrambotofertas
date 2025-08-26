@@ -1,8 +1,9 @@
 #!/usr/bin/env python3
 """
-Bot Telegram usando WEBHOOK (Application.run_webhook).
-Persistência: SQLite (bot.db).
-Destinado a rodar como Web Service (Render) com variáveis de ambiente TELEGRAM_TOKEN e WEBHOOK_URL.
+Bot Telegram com WEBHOOK usando FastAPI + python-telegram-bot (sem aiohttp).
+Recebe updates no endpoint /webhook e coloca na application.update_queue.
+Persistência em SQLite (bot.db).
+Destinado a rodar como Web Service (Render).
 """
 import os
 import sqlite3
@@ -10,6 +11,8 @@ import logging
 import unicodedata
 from typing import Optional
 
+from fastapi import FastAPI, Request, HTTPException
+import uvicorn
 from telegram import Update, Chat, Message
 from telegram.ext import (
     Application,
@@ -20,32 +23,27 @@ from telegram.ext import (
 
 # ---------- Config ----------
 DB_PATH = os.environ.get("BOT_DB_PATH", "bot.db")
-PORT = int(os.environ.get("PORT", os.environ.get("SERVER_PORT", 8443)))
+PORT = int(os.environ.get("PORT", 8000))
 TELEGRAM_TOKEN = os.environ.get("TELEGRAM_TOKEN")
-WEBHOOK_URL = os.environ.get("WEBHOOK_URL")  # EX: https://meuservico.onrender.com/webhook
+WEBHOOK_URL = os.environ.get("WEBHOOK_URL")  # ex: https://<seu-servico>.onrender.com/webhook
 MAX_WEBHOOK_CONNECTIONS = int(os.environ.get("MAX_WEBHOOK_CONNECTIONS", "40"))
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
 logger = logging.getLogger(__name__)
 
 if not TELEGRAM_TOKEN:
-    raise RuntimeError("Defina a variável de ambiente TELEGRAM_TOKEN")
+    raise RuntimeError("Defina TELEGRAM_TOKEN")
 if not WEBHOOK_URL:
-    raise RuntimeError("Defina a variável de ambiente WEBHOOK_URL (ex: https://meuservico.onrender.com/webhook)")
+    raise RuntimeError("Defina WEBHOOK_URL")
 
-# ---------- DB helpers ----------
+# ---------- DB ----------
 def init_db():
     conn = sqlite3.connect(DB_PATH, timeout=10)
     cur = conn.cursor()
     cur.execute("CREATE TABLE IF NOT EXISTS users (user_id INTEGER PRIMARY KEY, subscribed INTEGER DEFAULT 0)")
-    cur.execute(
-        "CREATE TABLE IF NOT EXISTS keywords (id INTEGER PRIMARY KEY AUTOINCREMENT, user_id INTEGER, keyword TEXT)"
-    )
-    cur.execute(
-        "CREATE TABLE IF NOT EXISTS watched_chats (chat_id INTEGER PRIMARY KEY, title TEXT, username TEXT)"
-    )
-    conn.commit()
-    conn.close()
+    cur.execute("CREATE TABLE IF NOT EXISTS keywords (id INTEGER PRIMARY KEY AUTOINCREMENT, user_id INTEGER, keyword TEXT)")
+    cur.execute("CREATE TABLE IF NOT EXISTS watched_chats (chat_id INTEGER PRIMARY KEY, title TEXT, username TEXT)")
+    conn.commit(); conn.close()
 
 def get_conn():
     return sqlite3.connect(DB_PATH, timeout=10)
@@ -78,21 +76,18 @@ def set_subscribed(user_id: int, subscribed: bool):
 def get_subscribed_users():
     conn = get_conn(); cur = conn.cursor()
     cur.execute("SELECT user_id FROM users WHERE subscribed=1")
-    rows = [r[0] for r in cur.fetchall()]
-    conn.close(); return rows
+    rows = [r[0] for r in cur.fetchall()]; conn.close(); return rows
 
 def get_keywords(user_id: int):
     conn = get_conn(); cur = conn.cursor()
     cur.execute("SELECT keyword FROM keywords WHERE user_id=?", (user_id,))
-    rows = [r[0] for r in cur.fetchall()]
-    conn.close(); return rows
+    rows = [r[0] for r in cur.fetchall()]; conn.close(); return rows
 
 def add_keyword(user_id: int, keyword: str) -> bool:
     ensure_user(user_id)
     conn = get_conn(); cur = conn.cursor()
     cur.execute("SELECT 1 FROM keywords WHERE user_id=? AND keyword=?", (user_id, keyword))
-    if cur.fetchone():
-        conn.close(); return False
+    if cur.fetchone(): conn.close(); return False
     cur.execute("INSERT INTO keywords (user_id, keyword) VALUES (?,?)", (user_id, keyword))
     conn.commit(); conn.close(); return True
 
@@ -110,10 +105,8 @@ def del_all_keywords(user_id: int):
 # ---------- watched chats ----------
 def add_watched_chat(chat: Chat):
     conn = get_conn(); cur = conn.cursor()
-    cur.execute(
-        "INSERT OR REPLACE INTO watched_chats (chat_id, title, username) VALUES (?,?,?)",
-        (chat.id, chat.title or chat.full_name or "", chat.username or "")
-    )
+    cur.execute("INSERT OR REPLACE INTO watched_chats (chat_id, title, username) VALUES (?,?,?)",
+                (chat.id, chat.title or chat.full_name or "", chat.username or ""))
     conn.commit(); conn.close()
 
 def list_watched_chats():
@@ -133,7 +126,7 @@ def remove_all_watched_chats():
 
 # ---------- Handlers ----------
 async def cmd_start(update: Update, context):
-    await update.message.reply_text("Olá! Sou o bot de notificações. Use /help para ver comandos.")
+    await update.message.reply_text("Olá! Use /help para ver comandos.")
 
 async def cmd_help(update: Update, context):
     txt = (
@@ -237,7 +230,6 @@ async def on_message(update: Update, context):
     if not msg:
         return
     chat = msg.chat
-    # only from registered watched chats
     rows = list_watched_chats()
     chat_ids = [cid for cid,_,_ in rows]
     if chat.id not in chat_ids:
@@ -261,48 +253,4 @@ async def on_message(update: Update, context):
             except Exception as e:
                 logger.exception("Falha ao encaminhar para %s: %s", uid, e)
 
-# ---------- Bootstrap / main ----------
-def build_app():
-    application = Application.builder().token(TELEGRAM_TOKEN).concurrent_updates(True).build()
-
-    # handlers
-    application.add_handler(CommandHandler("start", cmd_start))
-    application.add_handler(CommandHandler("help", cmd_help))
-    application.add_handler(CommandHandler("notifyme", cmd_notifyme))
-    application.add_handler(CommandHandler("removeme", cmd_removeme))
-    application.add_handler(CommandHandler("addp", cmd_addp))
-    application.add_handler(CommandHandler("listp", cmd_listp))
-    application.add_handler(CommandHandler("delp", cmd_delp))
-    application.add_handler(CommandHandler("delpall", cmd_delpall))
-    application.add_handler(CommandHandler("addgc", cmd_addgc))
-    application.add_handler(CommandHandler("listgc", cmd_listgc))
-    application.add_handler(CommandHandler("sairgc", cmd_sairgc))
-    application.add_handler(CommandHandler("sairgcall", cmd_sairgcall))
-
-    application.add_handler(MessageHandler(filters.ALL & (~filters.COMMAND), on_message))
-    return application
-
-if __name__ == "__main__":
-    init_db()
-    app = build_app()
-    logger.info("Iniciando webhook: %s (porta %s)", WEBHOOK_URL, PORT)
-
-    # run_webhook will set the webhook for you and run an aiohttp server internally
-    # webhook_url_path must match the path portion of WEBHOOK_URL
-    # ex: WEBHOOK_URL = https://meuservico.onrender.com/webhook  -> webhook_url_path="/webhook"
-    webhook_path = "/" + WEBHOOK_URL.rstrip("/").split("/", 3)[-1] if "/" in WEBHOOK_URL.rstrip("/") else "/webhook"
-    # If user provided full path with query, we still try to detect last component; fallback to "/webhook"
-    if not webhook_path.startswith("/"):
-        webhook_path = "/" + webhook_path
-
-    try:
-        app.run_webhook(
-            listen="0.0.0.0",
-            port=PORT,
-            webhook_url_path=webhook_path,
-            webhook_url=WEBHOOK_URL,
-            max_concurrent_connections=MAX_WEBHOOK_CONNECTIONS,
-        )
-    except Exception as exc:
-        logger.exception("Falha ao iniciar run_webhook: %s", exc)
-        raise
+# ---------- Application
