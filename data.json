@@ -1,14 +1,4 @@
 {
-  "subscribers": {
-      "<chat_id>": {
-          "username": "nome_do_usuario",
-          "keywords": ["monitor", "Teclado Magnético"]
-      }
-  },
-  "groups": {
-      "<chat_id>": {
-          "title": "Nome do Grupo",
-          "link": null
-      }
-  }
+  "subscribers": {},
+  "groups": {}
 }
