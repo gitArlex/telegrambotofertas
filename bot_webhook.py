@@ -374,9 +374,11 @@ def webhook():
 
 
 # Ao inicializar, tenta setar webhook
+import asyncio
+
 with app.app_context():
     try:
-        bot.set_webhook(WEBHOOK_URL)
+        asyncio.run(bot.set_webhook(WEBHOOK_URL))
         print('Webhook setado em', WEBHOOK_URL)
     except Exception as e:
         print('Falha ao setar webhook:', e)
